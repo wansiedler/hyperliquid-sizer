@@ -1,0 +1,14 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+.venv/
+session/
+relay.log
+
+# coverage
+.coverage
+coverage.xml
+htmlcov/
+*.pub
+bipboop

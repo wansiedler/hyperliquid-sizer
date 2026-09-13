@@ -1,0 +1,616 @@
+name: CI
+
+# Gating model, borrowed from the org pipelines:
+#   * hooks over CHANGED files are the blocking gate — new code must be clean,
+#     pre-existing debt in untouched files cannot red a PR;
+#   * the whole-tree pass is informational drift radar;
+#   * tests, actionlint and the image build are hard gates;
+#   * Trivy is a hard gate, except the Security-tab push (needs Advanced
+#     Security, which a private repo may not have).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  Quality: pre-commit hook suite (ruff, mypy, bandit, yamllint, ...) #
+  # ------------------------------------------------------------------ #
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          fetch-depth: 0   # the diff gate needs the merge-base with the base ref
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install toolchain
+        run: |
+          pip install --require-hashes --only-binary :all: -r .github/requirements-ci.lock
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # ---- THE blocking gate: changed files only ----
+      - name: Lint changed code (blocking)
+        env:
+          SKIP: no-commit-to-branch   # CI runs on main; the hook guards humans
+        run: |
+          # A PR diffs against its base. A push diffs against what was there
+          # before it — comparing main to main would gate on an empty diff and
+          # wave everything through. Falls back to HEAD^ when the event carries
+          # no "before" (a brand new branch, or a local act run).
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -n "$BASE" ] || BASE="${{ github.event.before }}"
+          case "$BASE" in
+            "" | 0000000000000000000000000000000000000000)
+              BASE=$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)
+              ;;
+          esac
+          FROM=$(git merge-base "$BASE" HEAD 2>/dev/null || echo "$BASE")
+          echo "diffing $FROM..HEAD"
+          set +e
+          out=$(pre-commit run --color never --from-ref "$FROM" --to-ref HEAD 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "## ❌ Diff gate (blocking)"
+              echo ""
+              echo '```'
+              grep -vE "Passed$|Skipped$" <<< "$out" || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          echo "## ✅ Diff gate: clean" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- whole-tree pass: informational ----
+      - name: Full-tree hooks (blocking)
+        if: ${{ !cancelled() }}
+        env:
+          SKIP: no-commit-to-branch
+        run: |
+          set +e
+          out=$(pre-commit run --all-files --color never 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            findings=$(grep -vE "Passed$|Skipped$" <<< "$out" || true)
+            {
+              echo "## ❌ Full-tree hooks"
+              echo ""
+              echo '```'
+              head -n 120 <<< "$findings"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          echo "## ✅ Full-tree hooks: clean" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  #  Tests: the parser is the part with logic worth pinning down        #
+  # ------------------------------------------------------------------ #
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 is what the image actually runs; the rest is the supported floor.
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install --require-hashes --only-binary :all: -r requirements.lock
+          pip install --require-hashes --only-binary :all: -r .github/requirements-ci.lock
+
+      - name: pytest with coverage
+        run: |
+          set +e
+          out=$(pytest --cov --cov-report=term-missing --cov-report=xml --color=no 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          {
+            echo "## $([ $rc -eq 0 ] && echo '✅' || echo '❌') pytest (py${{ matrix.python-version }})"
+            echo ""
+            echo '```'
+            tail -n 25 <<< "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # Per-file coverage as a table, so the number is visible without opening
+      # the step log or downloading the artifact.
+      - name: Coverage table to Summary
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'EOF'
+          import os, xml.etree.ElementTree as ET
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          py = os.environ["PY_VERSION"]
+          try:
+              root = ET.parse("coverage.xml").getroot()
+          except Exception as exc:
+              print(f"### ⚠️ Coverage (py{py}): no report ({exc})", file=out)
+              raise SystemExit(0)
+          total = float(root.get("line-rate", 0)) * 100
+          print(f"### Coverage (py{py}): **{total:.0f}%**", file=out)
+          print("", file=out)
+          print("| File | Statements | Missed | Covered |", file=out)
+          print("| --- | ---: | ---: | ---: |", file=out)
+          for cls in sorted(root.iter("class"), key=lambda c: c.get("filename")):
+              found = cls.find("lines")
+              lines = list(found) if found is not None else []
+              stmts = len(lines)
+              missed = sum(1 for line in lines if line.get("hits") == "0")
+              rate = float(cls.get("line-rate", 0)) * 100
+              mark = "✅" if rate == 100 else ("⚠️" if rate else "❌")
+              print(
+                  f"| `{cls.get('filename')}` | {stmts} | {missed} | {mark} {rate:.0f}% |",
+                  file=out,
+              )
+          EOF
+        env:
+          PY_VERSION: ${{ matrix.python-version }}
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7
+        # act cannot mint an ACTIONS_RUNTIME_TOKEN, so uploads always fail there.
+        if: ${{ !cancelled() && !env.ACT }}
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 30
+
+      # relay.py imports telethon/httpx at module level; a broken import must
+      # not wait for a container restart at 3am to be discovered. chat_id.py is
+      # deliberately excluded: it is a script, and importing it calls Telegram.
+      - name: Import smoke test
+        run: python -c "import relay; print('imports OK')"
+
+  # ------------------------------------------------------------------ #
+  #  actionlint: hard gate over the workflow files themselves           #
+  # ------------------------------------------------------------------ #
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        # The action shells out to docker, which act's job containers lack.
+        if: ${{ !env.ACT }}
+        uses: devops-actions/actionlint@ec02b36684b2f574f1d219ad0a43b082e46bf3e4   # v0.1.13
+
+      - name: actionlint results to Summary
+        if: ${{ always() && !env.ACT }}
+        run: |
+          f="actionlint-errors.json"
+          if [ -s "$f" ] && python3 -c "import json,sys; sys.exit(0 if json.load(open('$f')) else 1)"; then
+            {
+              echo "## ❌ actionlint findings"
+              echo ""
+              echo '```'
+              python3 -c "import json; [print(f\"{e['file']}:{e['line']}: {e['message']}\") for e in json.load(open('$f'))]"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ✅ actionlint: clean" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ------------------------------------------------------------------ #
+  #  Security: Trivy filesystem scan (vulns, secrets, misconfig)        #
+  #  BLOCKING: a scan that cannot run reds the build. Only the          #
+  #  Security-tab push is soft-fail — it needs GitHub Advanced          #
+  #  Security, which this private repo may not have.                    #
+  # ------------------------------------------------------------------ #
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read   # codeql-action reads the run it belongs to
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          persist-credentials: false
+
+      - name: Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Trivy table summary
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          severity: CRITICAL,HIGH
+
+      - name: Scan results to Summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          try:
+              sarif = json.load(open("trivy-results.sarif"))
+              results = [r for run in sarif.get("runs", []) for r in run.get("results", [])]
+          except Exception as e:
+              print(f"## ⚠️ Trivy: could not parse SARIF ({e})", file=out)
+              raise SystemExit(0)
+          if not results:
+              print("## ✅ Trivy: no findings", file=out)
+          else:
+              print(f"## ⚠️ Trivy: {len(results)} finding(s)", file=out)
+              print("", file=out)
+              print("| Rule | Level | Location |", file=out)
+              print("| --- | --- | --- |", file=out)
+              for r in results[:50]:
+                  loc = ""
+                  try:
+                      loc = r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                  except Exception:
+                      pass
+                  print(f"| {r.get('ruleId','?')} | {r.get('level','?')} | {loc} |", file=out)
+              if len(results) > 50:
+                  print(f"\n_…{len(results)-50} more in the trivy-report artifact._", file=out)
+          EOF
+
+      - name: Upload Trivy report (artifact)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7
+        if: ${{ always() && !env.ACT }}
+        with:
+          name: trivy-report
+          path: trivy-results.sarif
+          retention-days: 90
+
+      # The Security tab needs code scanning, which on a private repo means
+      # GitHub Advanced Security. Without it the upload cannot succeed and
+      # prints an error annotation on every single run, so it is opt-in:
+      #   gh variable set ENABLE_CODE_SCANNING --body true
+      # The trivy-report artifact above carries the same SARIF either way.
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63   # v4
+        if: ${{ always() && !env.ACT && vars.ENABLE_CODE_SCANNING == 'true' }}
+        continue-on-error: true
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ------------------------------------------------------------------ #
+  #  Image: the artifact that actually runs on the host                 #
+  # ------------------------------------------------------------------ #
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e   # v4
+        if: ${{ !env.ACT }}
+
+      - name: Build image
+        if: ${{ !env.ACT }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a   # v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: hyperliquid-sizer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # No .env in CI, so the relay must fail on missing config, not on a
+      # broken image. --help exercises the entrypoint without credentials.
+      - name: Smoke test the image
+        if: ${{ !env.ACT }}
+        run: |
+          docker run --rm hyperliquid-sizer:ci python relay.py --help
+          echo "## ✅ Image builds and starts" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trivy image scan
+        if: ${{ !env.ACT }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25   # v0.36.0
+        with:
+          scan-type: image
+          image-ref: hyperliquid-sizer:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"   # base-image CVEs are informational, not a merge blocker
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # the action enumerates the commits of its PR
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: gitleaks
+        if: ${{ !env.ACT }}
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e   # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install toolchain
+        run: |
+          pip install --require-hashes --only-binary :all: -r .github/requirements-ci.lock
+
+      # Blocking: a workflow that leaks its token or runs attacker-controlled
+      # input is a supply-chain hole, not a style nit.
+      - name: zizmor (workflow audit)
+        run: |
+          set +e
+          out=$(zizmor --persona=regular --format plain .github/workflows 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          {
+            echo "## $([ $rc -eq 0 ] && echo '✅' || echo '❌') zizmor"
+            echo ""
+            echo '```'
+            tail -n 60 <<< "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # Informational: a CVE in a linter cannot reach production from here,
+      # and a fresh advisory should not red an unrelated PR.
+      - name: pip-audit (CI toolchain)
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          out=$(pip-audit --strict --progress-spinner off 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::pip-audit findings in the CI toolchain (non-blocking)"
+            {
+              echo "## ⚠️ pip-audit (informational)"
+              echo ""
+              echo '```'
+              tail -n 40 <<< "$out"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ✅ pip-audit: no known CVEs" >> "$GITHUB_STEP_SUMMARY"
+          fi
+  sonar:
+    # Opt-in: SonarQube Cloud refuses a CI analysis while Automatic Analysis is
+    # enabled on the project, so switch that off first, then
+    #   gh variable set ENABLE_SONAR_CI --body true
+    if: ${{ vars.ENABLE_SONAR_CI == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+        with:
+          fetch-depth: 0   # Sonar attributes findings to commits; shallow blinds it
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7
+        if: ${{ env.SONAR_TOKEN != '' }}
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # Sonar reads coverage.xml rather than running the suite itself.
+      - name: Coverage report for Sonar
+        if: ${{ env.SONAR_TOKEN != '' }}
+        run: |
+          pip install --require-hashes --only-binary :all: -r requirements.lock
+          pip install --require-hashes --only-binary :all: -r .github/requirements-ci.lock
+          pytest --cov --cov-report=xml --color=no
+
+      - name: SonarQube scan
+        if: ${{ env.SONAR_TOKEN != '' && !env.ACT }}
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f   # v8.2.1
+
+      # The scanner returns as soon as the upload lands; the verdict is computed
+      # server-side afterwards. Without this step the job goes green while the
+      # Quality Gate is still pending, and the findings stay on sonarcloud.io
+      # where nothing in the run points at them.
+      - name: Quality Gate and findings to Summary
+        if: ${{ !cancelled() && env.SONAR_TOKEN != '' && !env.ACT }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, time, urllib.error, urllib.parse, urllib.request
+
+          token = os.environ["SONAR_TOKEN"]
+          summary_file = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+
+
+          def say(line=""):
+              """Write to the run summary and to the step log.
+
+              The summary renders on its own tab, so a step that only writes
+              there looks silent from the log -- which is exactly how the
+              earlier breakage stayed invisible.
+              """
+              print(line, file=summary_file)
+              print(line)
+
+
+          def api(url):
+              req = urllib.request.Request(url)
+              req.add_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return json.load(resp)
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode(errors="replace").strip()
+                  raise RuntimeError(f"{url.split('?')[0]} -> HTTP {exc.code} {detail}") from None
+
+
+          def report_gate():
+              """Write the verdict and the open issues; return True if the gate failed."""
+              report = dict(
+                  line.split("=", 1)
+                  for line in open(".scannerwork/report-task.txt").read().splitlines()
+                  if "=" in line
+              )
+              server, key, dashboard = (
+                  report["serverUrl"],
+                  report["projectKey"],
+                  report["dashboardUrl"],
+              )
+
+              # The compute engine queues the analysis; poll it out rather than
+              # guessing how long it takes.
+              task = {}
+              for _ in range(60):
+                  task = api(report["ceTaskUrl"])["task"]
+                  if task["status"] in ("SUCCESS", "FAILED", "CANCELED"):
+                      break
+                  time.sleep(5)
+
+              if task.get("status") != "SUCCESS":
+                  say(f"## ⚠️ Sonar: analysis {task.get('status', 'timed out')}")
+                  say(f"\n[Dashboard]({dashboard})")
+                  return False
+
+              # A pull request analysis is not addressable by analysisId -- that
+              # answers HTTP 400. Both endpoints take the same scope parameter,
+              # so build it once from whatever the task says it analysed.
+              if task.get("pullRequest"):
+                  scope = "&" + urllib.parse.urlencode({"pullRequest": task["pullRequest"]})
+              elif task.get("branch"):
+                  scope = "&" + urllib.parse.urlencode({"branch": task["branch"]})
+              else:
+                  scope = ""
+
+              gate = api(
+                  f"{server}/api/qualitygates/project_status"
+                  f"?{urllib.parse.urlencode({'projectKey': key})}{scope}"
+              )["projectStatus"]
+              mark = {"OK": "✅", "ERROR": "❌"}.get(gate["status"], "⚠️")
+              say(f"## {mark} Sonar Quality Gate: {gate['status']}")
+              say()
+
+              failed = [c for c in gate.get("conditions", []) if c["status"] != "OK"]
+              if failed:
+                  say("| Condition | Actual | Threshold |")
+                  say("| --- | ---: | ---: |")
+                  for c in failed:
+                      say(
+                          f"| {c['metricKey']} | {c.get('actualValue', '?')} "
+                          f"| {c['comparator']} {c.get('errorThreshold', '?')} |"
+                      )
+                  say()
+
+              # SonarQube Cloud names this parameter componentKeys; "components"
+              # is Server-only and answers HTTP 400 here.
+              query = urllib.parse.urlencode(
+                  {
+                      "componentKeys": key,
+                      "resolved": "false",
+                      "ps": 50,
+                      "s": "SEVERITY",
+                      "asc": "false",
+                  }
+              )
+              issues = api(f"{server}/api/issues/search?{query}{scope}")
+              found = issues.get("issues", [])
+              if not found:
+                  say("No open issues.")
+              else:
+                  say(f"### {issues.get('total', len(found))} open issue(s)")
+                  say()
+                  say("| Rule | Impact | Location | Message |")
+                  say("| --- | --- | --- | --- |")
+                  for issue in found:
+                      where = issue.get("component", "").split(":", 1)[-1]
+                      line = issue.get("line")
+                      impact = (
+                          ", ".join(
+                              f"{i['softwareQuality'].lower()}:{i['severity'].lower()}"
+                              for i in issue.get("impacts", [])
+                          )
+                          or issue.get("severity", "?")
+                      )
+                      # A pipe in the message would split the table row.
+                      message = issue.get("message", "").replace("|", "\\|")
+                      say(
+                          f"| `{issue.get('rule', '?')}` | {impact} "
+                          f"| {where}{f':{line}' if line else ''} | {message} |"
+                      )
+
+              say(f"\n[Full report]({dashboard})")
+              return gate["status"] == "ERROR"
+
+
+          # A hiccup in the reporting itself is not a reason to red the build:
+          # only the gate verdict is. The scan step already failed if the
+          # analysis never reached Sonar.
+          try:
+              failed_gate = report_gate()
+          except (OSError, RuntimeError, KeyError) as exc:
+              say(f"## ⚠️ Sonar: could not read the verdict ({exc})")
+              failed_gate = False
+
+          raise SystemExit(1 if failed_gate else 0)
+          EOF
+
+      - name: Note a missing token
+        if: ${{ env.SONAR_TOKEN == '' }}
+        run: |
+          echo "## ⏭️ Sonar: skipped (no SONAR_TOKEN secret)" >> "$GITHUB_STEP_SUMMARY"

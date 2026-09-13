@@ -1,0 +1,357 @@
+"""Read relayed alerts out loud on a Google Nest speaker.
+
+A Cast device never receives audio directly — it is handed a URL and fetches
+the file itself. So this module does two things: it serves the generated
+speech over HTTP on the LAN, and it tells the speaker where to find it.
+
+That is also why `TTS_HOST` must be the machine's LAN address, not localhost:
+the URL is resolved by the speaker, not by us.
+
+    CAST_HOST=192.168.1.177     # the Nest, from `dns-sd -B _googlecast._tcp`
+    TTS_HOST=192.168.1.178      # this machine, as the speaker sees it
+    TTS_PORT=8422               # published to the LAN in docker-compose.yml
+    SPEAK_ALERTS=1              # 0 to keep the speaker quiet
+    SPEAK_HOURS=23-8            # speak only from 23:00 to 8:00; empty = always
+    SPEAK_LIFECYCLE=1           # say "Relay up"/"Relay down"; 0 to mute
+"""
+
+import asyncio
+import logging
+import math
+import os
+import threading
+import time
+from datetime import datetime
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from uuid import NAMESPACE_DNS, UUID, uuid5
+
+from dotenv import load_dotenv
+
+from coin_names import COIN_NAMES
+
+log = logging.getLogger("relay.speaker")
+
+# Imported by relay.py ahead of its own load_dotenv("bipboop"), so read the file here
+# as well — without it CAST_HOST/TTS_HOST are empty and speaking stays off.
+load_dotenv("bipboop")
+
+CAST_HOST = os.getenv("CAST_HOST", "")
+CAST_PORT = int(os.getenv("CAST_PORT", "8009"))
+# pychromecast identifies a device by UUID. The real one comes from mDNS
+# (`dns-sd -B _googlecast._tcp`); without it a stable stand-in derived from
+# the address does just as well, since we address the speaker by host.
+CAST_UUID = os.getenv("CAST_UUID", "")
+TTS_HOST = os.getenv("TTS_HOST", "")
+TTS_PORT = int(os.getenv("TTS_PORT", "8422"))
+
+
+def exempt_from_proxy(*hosts: str) -> str:
+    """Keep the LAN endpoints off the HTTPS_PROXY tunnel; returns NO_PROXY.
+
+    pychromecast asks the Cast device for its type over HTTPS, and urllib
+    routes every HTTPS request through HTTPS_PROXY unless the host is in
+    NO_PROXY — exactly like httpx. Through the VPS the speaker does not
+    exist, so each spoken line first waited out a 30 s timeout, and the
+    poll loop that was speaking waited with it. The bot's own LAN hosts
+    are appended here so the config cannot forget them.
+    """
+    raw = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+    listed = [host.strip() for host in raw.split(",") if host.strip()]
+    for host in hosts:
+        if host and host not in listed:
+            listed.append(host)
+    value = ",".join(listed)
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = value
+    return value
+
+
+exempt_from_proxy(CAST_HOST, TTS_HOST)
+# Not /tmp: a predictable path in a world-writable directory is a
+# swap-the-file-under-us invitation. The directory is created 0700.
+TTS_DIR = Path(os.getenv("TTS_DIR") or Path.home() / ".cache/lexx-relay/tts")
+SPEAK_ALERTS = os.getenv("SPEAK_ALERTS", "1").lower() not in ("0", "false", "no", "")
+# A speaker already running an app (YouTube Music, radio) hands our URL to that
+# app, which ignores it — the alert is silently swallowed. Quitting first is the
+# only way to be heard, at the cost of stopping whatever was playing. Set
+# SPEAK_INTERRUPT=0 to stay quiet instead of interrupting.
+SPEAK_INTERRUPT = os.getenv("SPEAK_INTERRUPT", "1").lower() not in ("0", "false", "no", "")
+# After interrupting, put the previous media back where it left off. Only
+# works for plain URL media (Google's sleep-sounds loops are); app-private
+# streams cannot be brought back. Set SPEAK_RESUME=0 to leave the speaker
+# silent after an alert instead.
+SPEAK_RESUME = os.getenv("SPEAK_RESUME", "1").lower() not in ("0", "false", "no", "")
+# Say "Relay up"/"Relay down" on the speaker as the relay starts and stops.
+# The Telegram counterpart is NOTIFY_LIFECYCLE. Set SPEAK_LIFECYCLE=0 to mute.
+SPEAK_LIFECYCLE = os.getenv("SPEAK_LIFECYCLE", "1").lower() not in ("0", "false", "no", "")
+
+
+def parse_window(raw: str) -> tuple[int, int] | None:
+    """Parse "23-8" into (23, 8): speak from 23:00 up to, not including, 8:00.
+
+    Local time, wrapping past midnight when the start is the later hour.
+    Empty means around the clock; anything unparsable is refused loudly
+    rather than silently muting every alert.
+    """
+    if not raw.strip():
+        return None
+    start_text, sep, end_text = raw.partition("-")
+    try:
+        if not sep:
+            raise ValueError(raw)
+        start, end = int(start_text), int(end_text)
+        if not (0 <= start <= 23 and 0 <= end <= 23) or start == end:
+            raise ValueError(raw)
+    except ValueError:
+        log.warning("ignoring unusable SPEAK_HOURS=%r, speaking around the clock", raw)
+        return None
+    return start, end
+
+
+# Hours during which alerts are read aloud, e.g. SPEAK_HOURS=23-8 for
+# nights only. Telegram delivery is untouched; only the speaker sleeps.
+SPEAK_WINDOW = parse_window(os.getenv("SPEAK_HOURS", ""))
+# Google's default media receiver: the app that plays a plain URL.
+MEDIA_RECEIVER = "CC1AD845"
+
+# 📈 and 📉 carry the whole meaning of the line and are unpronounceable.
+TREND_WORDS = {"📈": "up", "📉": "down"}
+
+
+def enabled() -> bool:
+    """Speaking needs both endpoints; without them the relay just stays quiet."""
+    return bool(SPEAK_ALERTS and CAST_HOST and TTS_HOST)
+
+
+def hours_text() -> str:
+    """The speaking window as humans read it, for the startup notice."""
+    if SPEAK_WINDOW is None:
+        return "round the clock"
+    start, end = SPEAK_WINDOW
+    return f"{start:02d}:00–{end:02d}:00"
+
+
+def within_window(now: datetime | None = None) -> bool:
+    """Whether the clock currently allows speaking at all."""
+    if SPEAK_WINDOW is None:
+        return True
+    start, end = SPEAK_WINDOW
+    hour = (now or datetime.now()).hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def rounded(price: str) -> str:
+    """The price to three significant digits, for the ear.
+
+    The exact figure stays in the Telegram line; read aloud, "2383.66" is
+    seven syllables of noise where "2380" carries the same news. Significant
+    digits rather than fixed decimals, so cheap coins do not round to zero.
+    """
+    value = float(price)
+    if value == 0:
+        return "0"
+    digits = 2 - math.floor(math.log10(abs(value)))
+    text = f"{round(value, digits):.{max(digits, 0)}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def spoken(compact: str) -> str | None:
+    """Turn a relayed line into something a speaker can pronounce.
+
+    "LTC 📉 84.31" -> "Litecoin down, 84.3". Anything not in that shape
+    returns None rather than guessing.
+    """
+    parts = compact.split()
+    if len(parts) != 3:
+        return None
+    symbol, trend, price = parts
+    word = TREND_WORDS.get(trend)
+    if word is None:
+        return None
+    return f"{COIN_NAMES.get(symbol, symbol)} {word}, {rounded(price)}"
+
+
+class _QuietHandler(SimpleHTTPRequestHandler):
+    """SimpleHTTPRequestHandler, minus a request line per fetch on stderr."""
+
+    def log_message(self, format: str, *args: object) -> None:
+        log.debug("tts http: " + format, *args)
+
+
+def ensure_dir() -> None:
+    """Create the audio directory and hold it at 0700.
+
+    mkdir's `mode` applies only when it creates the directory, so a directory
+    that already exists — pre-created in the image, or left from an earlier
+    run — would keep whatever permissions it had. chmod every time instead.
+    """
+    TTS_DIR.mkdir(parents=True, exist_ok=True)
+    TTS_DIR.chmod(0o700)
+
+
+def serve_forever() -> ThreadingHTTPServer:
+    """Start the audio file server the speaker will fetch from."""
+    ensure_dir()
+    handler = partial(_QuietHandler, directory=str(TTS_DIR))
+    httpd = ThreadingHTTPServer(("0.0.0.0", TTS_PORT), handler)  # noqa: S104
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    log.info("tts server on 0.0.0.0:%s serving %s", TTS_PORT, TTS_DIR)
+    return httpd
+
+
+def write_speech(text: str, name: str) -> Path:
+    """Render text to an mp3 in the served directory and return its path."""
+    from gtts import gTTS
+
+    ensure_dir()
+    path = TTS_DIR / name
+    gTTS(text=text, lang="en").save(str(path))
+    return path
+
+
+def _resumable(cast) -> tuple[str, str, float] | None:
+    """What the speaker is playing now, if it can be brought back afterwards.
+
+    Only plain URL media can be re-cast; an app-private stream shows no
+    content_id and returns None. Our own TTS clips are never worth resuming.
+    """
+    if not SPEAK_RESUME or cast.app_id is None:
+        return None
+    controller = cast.media_controller
+    got = threading.Event()
+    try:
+        controller.update_status(callback_function=lambda *_: got.set())
+        got.wait(timeout=3)
+    # Deliberately broad: an app without the media namespace refuses the
+    # request, and a snapshot is never worth failing the alert over.
+    except Exception:  # noqa: BLE001
+        log.debug("no media status from %s", cast.app_id)
+        return None
+    status = controller.status
+    content = status.content_id or ""
+    if status.player_state != "PLAYING" or not content.startswith(("http://", "https://")):
+        return None
+    if content.startswith(f"http://{TTS_HOST}:{TTS_PORT}/"):  # NOSONAR
+        return None
+    return content, status.content_type or "audio/mpeg", status.current_time or 0.0
+
+
+def _wait_for(controller, states: tuple[str, ...], timeout: float) -> None:
+    """Poll until the player reaches one of `states`, or give up quietly."""
+    deadline = time.monotonic() + timeout
+    while controller.status.player_state not in states and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+
+def _resume(controller, media: tuple[str, str, float]) -> None:
+    """Put the interrupted media back, from where it left off."""
+    content, content_type, position = media
+    # Let the alert finish first: reach PLAYING, then drain to IDLE. The caps
+    # only matter when the receiver stops reporting; a clip is a few seconds.
+    _wait_for(controller, ("PLAYING",), timeout=10)
+    _wait_for(controller, ("IDLE", "UNKNOWN"), timeout=30)
+    log.info("resuming interrupted media at %.0fs", position)
+    controller.play_media(content, content_type, current_time=position, stream_type="BUFFERED")
+    controller.block_until_active(timeout=15)
+
+
+def cast_url(url: str) -> None:
+    """Point the speaker at a URL and wait for it to accept the media.
+
+    Whatever was playing is remembered and re-cast afterwards when it was
+    plain URL media (a sleep-sounds loop, a radio stream URL); app-private
+    sessions cannot be brought back.
+
+    Blocking: pychromecast is a synchronous library. Call it off the loop.
+    """
+    import pychromecast
+
+    uuid = UUID(CAST_UUID) if CAST_UUID else uuid5(NAMESPACE_DNS, CAST_HOST)
+    cast = pychromecast.get_chromecast_from_host(
+        (CAST_HOST, CAST_PORT, uuid, None, None), timeout=10
+    )
+    try:
+        cast.wait(timeout=10)
+        resume = _resumable(cast)
+        # Busy means a foreign app, or our receiver playing someone's media —
+        # after a resume the sleep loop lives in the media receiver too.
+        if cast.app_id not in (None, MEDIA_RECEIVER) or resume is not None:
+            if not SPEAK_INTERRUPT:
+                log.info("speaker busy with %s, staying quiet", cast.status.display_name)
+                return
+        if cast.app_id not in (None, MEDIA_RECEIVER):
+            log.info("interrupting %s", cast.status.display_name)
+            cast.quit_app()
+            deadline = time.monotonic() + 10
+            while cast.app_id not in (None, MEDIA_RECEIVER) and time.monotonic() < deadline:
+                time.sleep(0.5)
+        controller = cast.media_controller
+        # audio/mpeg is the registered MP3 type; audio/mp3 is not, and some
+        # Cast receivers refuse it.
+        controller.play_media(url, "audio/mpeg")
+        controller.block_until_active(timeout=15)
+        if resume is not None:
+            try:
+                _resume(controller, resume)
+            # Deliberately broad: the alert was spoken; a failed resume must
+            # not turn that success into a logged outage.
+            except Exception:  # noqa: BLE001
+                log.exception("could not resume %s", resume[0])
+    finally:
+        cast.disconnect()
+
+
+async def say(text: str, name: str) -> bool:
+    """Render and speak arbitrary text. Never raises: best-effort by design."""
+    if not enabled():
+        return False
+    try:
+        await asyncio.to_thread(write_speech, text, name)
+        # Plain HTTP on purpose: the speaker fetches from this host on the
+        # LAN, and a Cast device cannot validate a self-signed certificate.
+        await asyncio.to_thread(cast_url, f"http://{TTS_HOST}:{TTS_PORT}/{name}")  # NOSONAR
+    # Deliberately broad: speaking is best-effort and must never propagate.
+    except Exception:  # noqa: BLE001
+        log.exception("could not speak %r", text)
+        return False
+    log.info("spoke: %s", text)
+    return True
+
+
+async def announce(compact: str, counter: int) -> bool:
+    """Speak one relayed line. Never raises: a mute speaker is not an outage."""
+    if not enabled():
+        return False
+    if SPEAK_WINDOW is not None and not within_window():
+        log.debug("outside speaking hours %s-%s: %s", *SPEAK_WINDOW, compact)
+        return False
+    text = spoken(compact)
+    if text is None:
+        log.debug("not speakable: %s", compact)
+        return False
+    return await say(text, f"alert-{counter % 20}.mp3")
+
+
+async def trade(text: str) -> bool:
+    """Speak one of your own trade events, honoring SPEAK_HOURS like alerts."""
+    if not enabled():
+        return False
+    if SPEAK_WINDOW is not None and not within_window():
+        log.debug("outside speaking hours %s-%s: %s", *SPEAK_WINDOW, text)
+        return False
+    return await say(text, "trade.mp3")
+
+
+async def lifecycle(text: str) -> bool:
+    """Speak a start/stop notice, e.g. "Relay up".
+
+    Deliberately exempt from SPEAK_HOURS: the point is to hear that the relay
+    changed state whenever that happens, not only at night.
+    """
+    if not SPEAK_LIFECYCLE:
+        return False
+    return await say(text, "notice.mp3")

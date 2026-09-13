@@ -1,0 +1,76 @@
+# Copy to `bipboop` (gitignored) and fill in. Every value the bot reads.
+
+# --- Telegram -----------------------------------------------------------
+# @your_bot token from @BotFather
+BOT_TOKEN=
+# Where the bot posts: your own user id, or -100... for a group.
+TARGET_CHAT_ID=
+# Who may give the bot orders (/close, /stopall, /lev1 ...): your numeric
+# user id. Defaults to TARGET_CHAT_ID, which is the same number in a private
+# chat. A group target must set it, or every command is refused.
+OWNER_ID=
+# 0 silences the 🟢 up / 🔴 down notices.
+NOTIFY_LIFECYCLE=1
+RELAY_NAME=hyperliquid-sizer
+
+# --- Hyperliquid --------------------------------------------------------
+# The main wallet address the bot watches (0x...).
+HL_ACCOUNT=
+# An AGENT wallet's private key, generated on Hyperliquid under
+# Settings > API: it can trade but can never withdraw. Empty = read-only
+# (the watcher reports, the sizer/guard/trimmer stay off).
+HL_SECRET=
+# 1 = testnet (api.hyperliquid-testnet.xyz), 0 = mainnet.
+HL_TESTNET=0
+# 1 = only log the orders the bot WOULD send, 0 = actually send them.
+DRY_RUN=1
+
+# --- risk ---------------------------------------------------------------
+# Percent of the account (unrealised PnL excluded) that a stop-out costs,
+# fees included: the sizer sizes entry orders to it and the trimmer cuts
+# oversized positions back down to it.
+RISK_PCT=1
+# The fees the sizing budgets for (Hyperliquid base tier).
+MAKER_FEE=0.00015
+TAKER_FEE=0.00045
+# Positions above this leverage get market-closed by the guard.
+MAX_LEVERAGE=1
+# Warn (never act) when a position's reward-to-risk is below this. 0 = off.
+MIN_RR=2
+# The guard: stopless positions closed, stopless entry orders cancelled.
+RISK_GUARD=1
+# Seconds a breach gets to fix itself before the guard acts. 0 = instantly.
+GUARD_GRACE_SEC=45
+# The trimmer: cut a position whose stop-risk overshoots RISK_PCT.
+RISK_TRIM=1
+# Stop assumed for sizing when an order has none anywhere; 0 = skip such
+# orders (the guard will cancel them anyway).
+FALLBACK_SL_PCT=0
+# How often the watchers poll, seconds.
+POLL_SEC=2
+
+# --- charts -------------------------------------------------------------
+CHART_INTERVAL=15
+CHART_BARS=180
+
+# --- TradingView alerts over a webhook ----------------------------------
+# TradingView charts Hyperliquid (data only — it cannot route orders), so
+# alerts drawn on any chart POST here and land in the chat. The path is the
+# only auth — make it long and random. Empty disables.
+TV_WEBHOOK_SECRET=
+TV_PORT=8433
+# The public origin a tunnel (cloudflared) exposes the webhook on.
+TV_PUBLIC_URL=
+# The journal link, for /links and the up notice.
+JOURNAL_URL=
+
+# --- trade journal in Google Sheets --------------------------------------
+# Same Apps Script contract as bybit-tv-sizer; both empty disables it.
+SHEETS_URL=
+SHEETS_SECRET=
+
+# --- speaker (optional, same stack as bybit-tv-sizer) --------------------
+CAST_HOST=
+TTS_HOST=
+TTS_PORT=8432
+SPEAK_HOURS=08:00-23:00

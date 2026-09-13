@@ -1,0 +1,20 @@
+services:
+  relay:
+    build: .
+    image: hyperliquid-sizer
+    container_name: hyperliquid-sizer
+    restart: unless-stopped
+    # SIGTERM -> the bot posts its shutdown notice before exiting.
+    stop_grace_period: 30s
+    env_file: bipboop
+    environment:
+      # SPEAK_HOURS is wall-clock time; without this the container sits in
+      # UTC and speaks two hours late.
+      TZ: ${TZ:-Europe/Berlin}
+    ports:
+      # The Nest fetches the spoken alert from here — LAN, not just localhost.
+      - "${TTS_PORT:-8432}:${TTS_PORT:-8432}"
+      # TradingView webhook receiver; harmless while TV_WEBHOOK_SECRET is
+      # empty. Loopback only: a tunnel on the host is what the internet talks
+      # to. A router port-forward instead needs TV_BIND=0.0.0.0.
+      - "${TV_BIND:-127.0.0.1}:${TV_PORT:-8433}:${TV_PORT:-8433}"

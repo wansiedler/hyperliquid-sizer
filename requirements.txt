@@ -1,0 +1,10 @@
+# Declared ranges. Regenerate the lock after editing this file:
+#
+#     uv pip compile requirements.txt --generate-hashes -o requirements.lock
+#
+httpx>=0.28.1
+python-dotenv>=1.2.3
+PyChromecast>=14.0.10
+gTTS>=2.5.4
+Pillow>=12.3.0
+hyperliquid-python-sdk>=0.19.0
