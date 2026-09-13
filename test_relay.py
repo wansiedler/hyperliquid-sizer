@@ -54,7 +54,7 @@ class FakeHTTP:
             media = _json.loads(data["media"])
             self.posted.append((media[0].get("caption", ""), len(media), len(files or {})))
         else:
-            self.posted.append(data["caption"])
+            self.posted.append((data or {})["caption"])
         return self._post_response
 
 

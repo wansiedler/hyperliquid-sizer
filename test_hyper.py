@@ -184,10 +184,10 @@ def test_exchange_builds_once_from_the_key(monkeypatch):
         def from_key(key):
             return f"wallet:{key}"
 
-    eth_account.Account = Account
+    eth_account.Account = Account  # type: ignore[attr-defined]
     hl_pkg = types.ModuleType("hyperliquid")
     hl_exchange = types.ModuleType("hyperliquid.exchange")
-    hl_exchange.Exchange = StubExchange
+    hl_exchange.Exchange = StubExchange  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "eth_account", eth_account)
     monkeypatch.setitem(sys.modules, "hyperliquid", hl_pkg)
     monkeypatch.setitem(sys.modules, "hyperliquid.exchange", hl_exchange)
