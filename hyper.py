@@ -29,7 +29,42 @@ load_dotenv("bipboop")
 TESTNET = os.getenv("HL_TESTNET", "0") == "1"
 API_URL = "https://api.hyperliquid-testnet.xyz" if TESTNET else "https://api.hyperliquid.xyz"
 ACCOUNT = os.getenv("HL_ACCOUNT", "")
-SECRET = os.getenv("HL_SECRET", "")
+
+
+def _secret() -> str:
+    """The agent key: from the environment, or from the macOS Keychain.
+
+    With HL_SECRET_KEYCHAIN naming a Keychain service, the key never sits in
+    a file at all: `security add-generic-password -s <service> -a agent -w`
+    stores it encrypted, and the bot reads it at startup. HL_SECRET wins when
+    both are set. (The Keychain path needs the bot running on the host, not
+    in Docker — a container cannot reach the macOS Keychain.)
+    """
+    direct = os.getenv("HL_SECRET", "")
+    if direct:
+        return direct
+    service = os.getenv("HL_SECRET_KEYCHAIN", "")
+    if not service:
+        return ""
+    import subprocess
+
+    try:
+        found = subprocess.run(  # noqa: S603, S607 - fixed argv, no shell
+            ["security", "find-generic-password", "-w", "-s", service],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return found.stdout.strip()
+    # Deliberately broad: a locked or missing Keychain entry means read-only
+    # mode, not a crash before the watchers even start.
+    except Exception:  # noqa: BLE001
+        log.exception("keychain read failed for %s", service)
+        return ""
+
+
+SECRET = _secret()
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 

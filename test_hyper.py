@@ -198,3 +198,54 @@ def test_exchange_builds_once_from_the_key(monkeypatch):
 
     assert built == {"wallet": "wallet:0xkey", "base_url": hyper.API_URL, "account": "0xmain"}
     assert hyper.exchange() is first  # cached
+
+
+def test_secret_prefers_the_environment(monkeypatch):
+    monkeypatch.setenv("HL_SECRET", "0xdirect")
+    monkeypatch.setenv("HL_SECRET_KEYCHAIN", "hl-sizer")
+
+    assert hyper._secret() == "0xdirect"
+
+
+def test_secret_empty_without_any_source(monkeypatch):
+    monkeypatch.delenv("HL_SECRET", raising=False)
+    monkeypatch.delenv("HL_SECRET_KEYCHAIN", raising=False)
+
+    assert hyper._secret() == ""
+
+
+def test_secret_reads_the_keychain(monkeypatch):
+    import subprocess
+
+    monkeypatch.delenv("HL_SECRET", raising=False)
+    monkeypatch.setenv("HL_SECRET_KEYCHAIN", "hl-sizer")
+    seen = {}
+
+    def fake_run(argv, capture_output, text, check, timeout):
+        seen["argv"] = argv
+
+        class Out:
+            stdout = "0xfromkeychain\n"
+
+        return Out()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert hyper._secret() == "0xfromkeychain"
+    assert seen["argv"] == ["security", "find-generic-password", "-w", "-s", "hl-sizer"]
+
+
+def test_secret_survives_a_locked_keychain(monkeypatch, caplog):
+    import subprocess
+
+    monkeypatch.delenv("HL_SECRET", raising=False)
+    monkeypatch.setenv("HL_SECRET_KEYCHAIN", "hl-sizer")
+
+    def refuse(*args, **kwargs):
+        raise subprocess.CalledProcessError(44, "security")
+
+    monkeypatch.setattr(subprocess, "run", refuse)
+
+    with caplog.at_level("ERROR", logger="relay.hyper"):
+        assert hyper._secret() == ""
+    assert "keychain read failed" in caplog.text

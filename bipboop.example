@@ -20,6 +20,11 @@ HL_ACCOUNT=
 # Settings > API: it can trade but can never withdraw. Empty = read-only
 # (the watcher reports, the sizer/guard/trimmer stay off).
 HL_SECRET=
+# Instead of writing the key into this file, store it in the macOS Keychain
+# and name the service here (host runs only — Docker cannot reach Keychain):
+#   security add-generic-password -s hl-sizer -a agent -w '0x...'
+# HL_SECRET wins when both are set.
+HL_SECRET_KEYCHAIN=
 # 1 = testnet (api.hyperliquid-testnet.xyz), 0 = mainnet.
 HL_TESTNET=0
 # 1 = only log the orders the bot WOULD send, 0 = actually send them.

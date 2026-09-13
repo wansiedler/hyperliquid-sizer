@@ -51,6 +51,17 @@ an **agent wallet** generated on Hyperliquid under Settings → API: it signs
 orders on behalf of the account but **can never withdraw**. `DRY_RUN=1`
 (the default) logs every order the bot would send instead of sending it.
 
+The key does not have to sit in a file: store it in the macOS Keychain
+(`security add-generic-password -s hl-sizer -a agent -w '0x...'`) and set
+`HL_SECRET_KEYCHAIN=hl-sizer` — the bot reads it at startup and the config
+file carries no secret. Host runs only; a Docker container cannot reach the
+Keychain. Note what this does and does not buy: the key is encrypted at
+rest and absent from every file, but any process running as your user while
+the Keychain is unlocked could still ask for it — the hard ceiling on the
+damage is the agent wallet itself (no withdrawals, revocable, optional
+expiry). Hyperliquid has no per-key IP whitelist the way Bybit does: a
+signature is valid from any address, so key hygiene is the whole game.
+
 ## Setup
 
 ```bash
