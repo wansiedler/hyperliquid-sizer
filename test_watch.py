@@ -692,16 +692,16 @@ def test_trade_warnings_flag_a_thin_rr():
     fine = Position("long", 1.0, 100.0, 100.0, take_profit=110.0, stop_loss=99.0)
     naked = Position("long", 1.0, 100.0, 100.0)
 
-    assert watch.trade_warnings(thin, 1000.0) == ["⚠️ RR 1.00 < 2"]
-    assert watch.trade_warnings(fine, 1000.0) == []
-    assert watch.trade_warnings(naked, 1000.0) == []
+    assert watch.trade_warnings(thin) == ["⚠️ RR 1.00 < 2"]
+    assert watch.trade_warnings(fine) == []
+    assert watch.trade_warnings(naked) == []
 
 
 def test_trade_warnings_off_without_min_rr(monkeypatch):
     monkeypatch.setattr(watch, "MIN_RR", 0.0)
     thin = Position("long", 1.0, 100.0, 100.0, take_profit=101.0, stop_loss=99.0)
 
-    assert watch.trade_warnings(thin, 1000.0) == []
+    assert watch.trade_warnings(thin) == []
 
 
 def test_tick_primes_silently(keyed):
@@ -730,7 +730,8 @@ def test_tick_announces_an_entry_with_chart(keyed):
     assert out.photos, "the entry must go out as a chart caption"
     caption = out.photos[0]
     assert caption.startswith("💰📈BTC 50,000$@100000 | RR3.00")
-    assert "sl99000:" in caption and "tp103000:" in caption
+    assert "sl99000:" in caption
+    assert "tp103000:" in caption
     assert "комса6.75" in caption
     assert out.spoken == ["Bitcoin long opened"]
 
@@ -886,8 +887,10 @@ def test_tick_announces_a_close_with_journal(keyed, monkeypatch):
     # 1500 - 23 fees - 2 funding = 1475
     assert caption.startswith("💸<b>+1,475.00</b>=<b>1,000.00$</b>(+147.50%)·📈BTC·тейк")
     assert "(комса 23.00, фанд 2.00)" in caption
-    assert logged and logged[0]["row"][15] == "тейк"
-    assert "png" in logged[0] and logged[0]["name"] == "BTC-1700010000000"
+    assert logged
+    assert logged[0]["row"][15] == "тейк"
+    assert "png" in logged[0]
+    assert logged[0]["name"] == "BTC-1700010000000"
     assert out.spoken == ["Bitcoin long closed, profit 1475"]
 
 
@@ -907,7 +910,8 @@ def test_close_notice_survives_a_fills_refusal(keyed, caplog):
     with caplog.at_level("ERROR", logger="relay.watch"):
         line, spoken, png = asyncio.run(watch._close_notice(http, "BTC", LONG, "x"))
 
-    assert line is None and png is None
+    assert line is None
+    assert png is None
 
 
 def test_close_notice_without_a_birth_looks_a_day_back(keyed, monkeypatch):
@@ -924,7 +928,8 @@ def test_close_notice_without_a_birth_looks_a_day_back(keyed, monkeypatch):
 
     line, spoken, png = asyncio.run(watch._close_notice(http, "BTC", LONG, "x"))
 
-    assert line is not None and line.startswith("💸<b>+49.00</b>")
+    assert line is not None
+    assert line.startswith("💸<b>+49.00</b>")
 
 
 def test_positions_do_not_cache_births_past_a_fills_refusal(keyed, caplog):
@@ -979,7 +984,8 @@ def test_positions_report_builds_blocks_and_album(keyed):
     assert report == ""  # the album carried it
     caption = out.photos[0]
     assert "📈BTC 50,000$@100000 | RR3.00" in caption
-    assert "sl99000:" in caption and "tp103000:" in caption
+    assert "sl99000:" in caption
+    assert "tp103000:" in caption
     assert "−фанд0.40" in caption
     assert "📉ETH 6,000$@3000" in caption
     assert "ΣPnL" in caption
@@ -1029,8 +1035,8 @@ def test_stopall_survives_a_refusal(keyed):
     assert asyncio.run(watch.close_everything(http)) == watch._NO_ANSWER
 
 
-def test_stopall_with_nothing_open_disarms(keyed):
-    watch._stopall_armed = 0.0
+def test_stopall_with_nothing_open_disarms(keyed, monkeypatch):
+    monkeypatch.setattr(watch, "_stopall_armed", 0.0)
 
     assert "нечего" in asyncio.run(watch.close_everything(FakeHTTP()))
 
@@ -1061,7 +1067,7 @@ def test_close_needs_arguments_and_a_position(keyed):
     http.state["assetPositions"] = [pos_row()]
 
     assert "Какую позицию" in asyncio.run(watch.close_position(http, " "))
-    assert "Позиции ETH нет. Открыто: BTC" == asyncio.run(watch.close_position(http, "ETH"))
+    assert asyncio.run(watch.close_position(http, "ETH")) == "Позиции ETH нет. Открыто: BTC"
 
 
 def test_close_needs_the_address():
@@ -1163,15 +1169,21 @@ def test_stats_chart_failure_still_answers(keyed, monkeypatch):
 def test_market_report_sends_the_snapshot(keyed):
     out = Recorder()
 
-    assert asyncio.run(watch.market_report(FakeHTTP(), out.send_photo)) == ""
-    assert out.photos and out.photos[0].startswith("BTC ")
+    asyncio.run(watch.market_report(FakeHTTP(), out.send_photo))
+
+    assert out.photos
+    assert out.photos[0].startswith("BTC ")
 
 
 def test_market_report_without_a_sender_or_candles(keyed):
-    assert asyncio.run(watch.market_report(FakeHTTP(), None)) == ""
+    out = Recorder()
+
+    asyncio.run(watch.market_report(FakeHTTP(), None))
     http = FakeHTTP()
     http.fail_types = {"candleSnapshot"}
-    assert asyncio.run(watch.market_report(http, Recorder().send_photo)) == ""
+    asyncio.run(watch.market_report(http, out.send_photo))
+
+    assert out.photos == []
 
 
 def test_price_before_reads_the_mids(keyed):
@@ -1222,7 +1234,8 @@ def test_money_tick_primes_then_announces(keyed, monkeypatch):
     assert out.sent == ["💵 вывел -100.00 USDC · деп 1,000.00$"]
     assert logged[0]["row"][1] == "перевод"
     assert logged[0]["row"][-1] == -100.0
-    assert "deposit-0xa" in seen and "withdraw-0xb" in seen
+    assert "deposit-0xa" in seen
+    assert "withdraw-0xb" in seen
 
 
 def test_money_tick_skips_seen_and_missing_depo(keyed, monkeypatch):

@@ -330,7 +330,8 @@ def _naked_entries(orders: list[dict], open_now: dict[str, Position]) -> dict[st
 
 def _forget_fixed(naked: dict[str, dict], open_now: dict[str, Position]) -> None:
     """Drop guard memory for breaches that healed themselves."""
-    for key in list(_guard_seen):
+    # A list copy on purpose: the dict shrinks inside the loop.
+    for key in list(_guard_seen):  # NOSONAR
         if key.startswith("order:"):
             if key not in naked:
                 del _guard_seen[key]
@@ -361,7 +362,7 @@ def _say(coin: str) -> str:
     return COIN_NAMES.get(coin, coin)
 
 
-async def _cancel_naked(http: httpx.AsyncClient, naked: dict[str, dict], send, speak) -> None:
+async def _cancel_naked(naked: dict[str, dict], send, speak) -> None:
     """Cancel entry orders that still have no stop once the grace runs out."""
     for key, order in naked.items():
         coin = order.get("coin", "")
@@ -382,9 +383,7 @@ async def _cancel_naked(http: httpx.AsyncClient, naked: dict[str, dict], send, s
             await send(f"❌ {coin}: не смог отменить лимитку ({exc})")
 
 
-async def _enforce_rules(
-    http: httpx.AsyncClient, open_now: dict[str, Position], send, speak
-) -> None:
+async def _enforce_rules(open_now: dict[str, Position], send, speak) -> None:
     """Market-close positions that still break a rule once the grace runs out."""
     for coin, position in open_now.items():
         reason = _guard_violation(position)
@@ -424,8 +423,8 @@ async def guard(
         return
     naked = _naked_entries(orders, open_now)
     _forget_fixed(naked, open_now)
-    await _cancel_naked(http, naked, send, speak)
-    await _enforce_rules(http, open_now, send, speak)
+    await _cancel_naked(naked, send, speak)
+    await _enforce_rules(open_now, send, speak)
 
 
 # ---------------------------------------------------------------------------
@@ -804,7 +803,7 @@ def describe(kind: str, coin: str, was: Position | None, now: Position | None) -
     return f"💸{_arrow(was.side)}{coin}", f"{name} {was.side} closed"
 
 
-def trade_warnings(position: Position, depo: float | None) -> list[str]:
+def trade_warnings(position: Position) -> list[str]:
     """RR below MIN_RR — a warning, never an action."""
     warnings = []
     if position.take_profit is not None and position.stop_loss and MIN_RR:
@@ -864,7 +863,7 @@ async def _entry_notice(
         line += "\n" + "\n".join(exits)
     if fee:
         line += f"\nкомса{_sig2(fee)}"
-    for warn in trade_warnings(now, depo):
+    for warn in trade_warnings(now):
         line += f"\n{html.escape(warn)}"
     tp_note, sl_note = _chart_notes(target, at_sl, depo)
     png = await entry_chart(
@@ -1215,6 +1214,25 @@ async def force_leverage_one(http: httpx.AsyncClient, query: str = "") -> str:
     return "\n".join(lines)
 
 
+def _daily_results(fills: list[dict], days: int) -> tuple[list[float], int, int]:
+    """(net PnL per day, closes counted, wins) over the last `days` days."""
+    start = datetime.now().date() - timedelta(days=days - 1)
+    daily = [0.0] * days
+    trades = wins = 0
+    for f in fills:
+        if not str(f.get("dir", "")).startswith("Close"):
+            continue
+        day = datetime.fromtimestamp(int(f.get("time") or 0) / 1000).date()
+        if day < start:
+            continue
+        net = float(f.get("closedPnl") or 0) - float(f.get("fee") or 0)
+        daily[(day - start).days] += net
+        trades += 1
+        if net >= 0:
+            wins += 1
+    return daily, trades, wins
+
+
 async def stats_report(http: httpx.AsyncClient, send_photo=None, arg: str = "") -> str:
     """Closed results of the last N days (default 30), with the equity curve.
 
@@ -1233,20 +1251,7 @@ async def stats_report(http: httpx.AsyncClient, send_photo=None, arg: str = "") 
     except Exception:  # noqa: BLE001
         log.exception("stats fills failed")
         return _NO_ANSWER
-    start = datetime.now().date() - timedelta(days=days - 1)
-    daily = [0.0] * days
-    trades = wins = 0
-    for f in fills:
-        if not str(f.get("dir", "")).startswith("Close"):
-            continue
-        day = datetime.fromtimestamp(int(f.get("time") or 0) / 1000).date()
-        if day < start:
-            continue
-        net = float(f.get("closedPnl") or 0) - float(f.get("fee") or 0)
-        daily[(day - start).days] += net
-        trades += 1
-        if net >= 0:
-            wins += 1
+    daily, trades, wins = _daily_results(fills, days)
     total = sum(daily)
     depo = await equity(http)
     text = (
@@ -1266,10 +1271,10 @@ async def stats_report(http: httpx.AsyncClient, send_photo=None, arg: str = "") 
     return text
 
 
-async def market_report(http: httpx.AsyncClient, send_photo=None) -> str:
+async def market_report(http: httpx.AsyncClient, send_photo=None) -> None:
     """BTC and ETH snapshot charts for /status."""
     if send_photo is None:
-        return ""
+        return
     try:
         pngs = []
         closes = []
@@ -1291,7 +1296,6 @@ async def market_report(http: httpx.AsyncClient, send_photo=None) -> str:
     # Deliberately broad: the market picture is garnish on /status.
     except Exception:  # noqa: BLE001
         log.exception("no market snapshot")
-    return ""
 
 
 async def price_before(http: httpx.AsyncClient, coin: str) -> float | None:

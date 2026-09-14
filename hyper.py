@@ -49,7 +49,8 @@ def _secret() -> str:
     import subprocess
 
     try:
-        found = subprocess.run(  # noqa: S603, S607 - fixed argv, no shell
+        # A fixed argv and no shell: nothing user-controlled reaches exec.
+        found = subprocess.run(  # noqa: S603, S607
             ["security", "find-generic-password", "-w", "-s", service],
             capture_output=True,
             text=True,

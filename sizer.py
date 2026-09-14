@@ -38,13 +38,18 @@ def enabled() -> bool:
     return hyper.enabled() and bool(hyper.SECRET)
 
 
-def _stop_of(order: dict, orders: list[dict]) -> float | None:
-    """The stop price guarding this entry, wherever it lives."""
+def _child_stop(order: dict) -> float | None:
+    """The stop among the order's own TP/SL children, when priced."""
     for child in order.get("children") or []:
         if "Stop" in str(child.get("orderType", "")):
             price = float(child.get("triggerPx") or 0)
             if price > 0:
                 return price
+    return None
+
+
+def _account_stop(order: dict, orders: list[dict]) -> float | None:
+    """A reduce-only stop trigger resting on the same coin, when priced."""
     for other in orders:
         if (
             other.get("coin") == order.get("coin")
@@ -55,11 +60,19 @@ def _stop_of(order: dict, orders: list[dict]) -> float | None:
             price = float(other.get("triggerPx") or 0)
             if price > 0:
                 return price
-    if FALLBACK_SL_PCT > 0:
+    return None
+
+
+def _stop_of(order: dict, orders: list[dict]) -> float | None:
+    """The stop price guarding this entry, wherever it lives."""
+    stop = _child_stop(order)
+    if stop is None:
+        stop = _account_stop(order, orders)
+    if stop is None and FALLBACK_SL_PCT > 0:
         entry = float(order.get("limitPx") or 0)
         sign = 1 - FALLBACK_SL_PCT if order.get("side") == "B" else 1 + FALLBACK_SL_PCT
-        return entry * sign
-    return None
+        stop = entry * sign
+    return stop
 
 
 def target_qty(order: dict, stop: float, equity: float, step: float) -> float | None:
