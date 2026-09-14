@@ -399,7 +399,7 @@ def guarding(acting, monkeypatch):
 
 
 def test_guard_stays_dormant_when_disabled(acting):
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], Recorder().send, Recorder().speak))
 
     assert acting.calls == []
 
@@ -407,7 +407,7 @@ def test_guard_stays_dormant_when_disabled(acting):
 def test_guard_closes_a_stopless_position_instantly(guarding):
     out = Recorder()
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], out.send, out.speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], out.send, out.speak))
 
     assert guarding.calls == [("market_close", "BTC")]
     assert out.sent == ["🛑 BTC закрыт маркетом риск-менеджером: нет стопа"]
@@ -416,7 +416,7 @@ def test_guard_closes_a_stopless_position_instantly(guarding):
 def test_guard_resets_leverage_after_closing(guarding):
     out = Recorder()
 
-    asyncio.run(watch.guard(FakeHTTP(), {"ETH": LEVERED}, [], out.send, out.speak))
+    asyncio.run(watch.guard({"ETH": LEVERED}, [], out.send, out.speak))
 
     assert guarding.calls == [("market_close", "ETH"), ("update_leverage", "ETH", 1)]
     assert out.sent == [
@@ -433,7 +433,7 @@ def test_guard_survives_a_failed_leverage_reset(guarding, monkeypatch, caplog):
     monkeypatch.setattr(hyper, "update_leverage", refuse)
 
     with caplog.at_level("ERROR", logger="relay.watch"):
-        asyncio.run(watch.guard(FakeHTTP(), {"ETH": LEVERED}, [], out.send, out.speak))
+        asyncio.run(watch.guard({"ETH": LEVERED}, [], out.send, out.speak))
 
     assert out.sent == ["🛑 ETH закрыт маркетом риск-менеджером: плечо 3x > 1x"]
     assert "leverage reset failed" in caplog.text
@@ -447,13 +447,13 @@ def test_guard_reports_a_refused_close(guarding, monkeypatch):
 
     monkeypatch.setattr(hyper, "market_close", refuse)
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], out.send, out.speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], out.send, out.speak))
 
     assert out.sent == ["❌ BTC: риск-менеджер не смог закрыть (min qty)"]
 
 
 def test_guard_leaves_a_covered_position_alone(guarding):
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": COVERED}, [], Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard({"BTC": COVERED}, [], Recorder().send, Recorder().speak))
 
     assert guarding.calls == []
 
@@ -462,7 +462,7 @@ def test_guard_warns_first_with_grace(guarding, monkeypatch):
     monkeypatch.setattr(watch, "GUARD_GRACE", 45.0)
     out = Recorder()
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], out.send, out.speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], out.send, out.speak))
 
     assert guarding.calls == []
     assert out.sent == ["🛑 BTC: нет стопа — закрою маркетом через 45с"]
@@ -474,7 +474,7 @@ def test_guard_acts_once_the_grace_runs_out(guarding, monkeypatch):
     out = Recorder()
     watch._guard_seen["BTC"] = time.monotonic() - 46
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], out.send, out.speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], out.send, out.speak))
 
     assert guarding.calls == [("market_close", "BTC")]
 
@@ -483,7 +483,7 @@ def test_guard_holds_inside_the_window(guarding, monkeypatch):
     monkeypatch.setattr(watch, "GUARD_GRACE", 45.0)
     watch._guard_seen["BTC"] = time.monotonic() - 1
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": NAKED_POS}, [], Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard({"BTC": NAKED_POS}, [], Recorder().send, Recorder().speak))
 
     assert guarding.calls == []
 
@@ -492,7 +492,7 @@ def test_guard_forgets_healed_breaches(guarding):
     watch._guard_seen["BTC"] = 1.0
     watch._guard_seen["order:9"] = 1.0
 
-    asyncio.run(watch.guard(FakeHTTP(), {"BTC": COVERED}, [], Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard({"BTC": COVERED}, [], Recorder().send, Recorder().speak))
 
     assert watch._guard_seen == {}
 
@@ -500,7 +500,7 @@ def test_guard_forgets_healed_breaches(guarding):
 def test_guard_cancels_a_naked_entry_order(guarding):
     out = Recorder()
 
-    asyncio.run(watch.guard(FakeHTTP(), {}, [entry_order()], out.send, out.speak))
+    asyncio.run(watch.guard({}, [entry_order()], out.send, out.speak))
 
     assert guarding.calls == [("cancel_order", "BTC", 5)]
     assert out.sent == ["🛑 BTC: лимитка без стопа отменена риск-менеджером"]
@@ -510,7 +510,7 @@ def test_guard_warns_about_a_naked_order_with_grace(guarding, monkeypatch):
     monkeypatch.setattr(watch, "GUARD_GRACE", 45.0)
     out = Recorder()
 
-    asyncio.run(watch.guard(FakeHTTP(), {}, [entry_order()], out.send, out.speak))
+    asyncio.run(watch.guard({}, [entry_order()], out.send, out.speak))
 
     assert guarding.calls == []
     assert out.sent == ["🛑 BTC: лимитка без стопа — отменю через 45с"]
@@ -524,7 +524,7 @@ def test_guard_reports_a_refused_cancel(guarding, monkeypatch):
 
     monkeypatch.setattr(hyper, "cancel_order", refuse)
 
-    asyncio.run(watch.guard(FakeHTTP(), {}, [entry_order()], out.send, out.speak))
+    asyncio.run(watch.guard({}, [entry_order()], out.send, out.speak))
 
     assert out.sent == ["❌ BTC: не смог отменить лимитку (gone)"]
 
@@ -539,7 +539,7 @@ def test_guard_spares_protected_entries(guarding):
     ]
     open_now = {"SOL": Position("long", 1.0, 200.0, 200.0, stop_loss=195.0)}
 
-    asyncio.run(watch.guard(FakeHTTP(), open_now, orders, Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard(open_now, orders, Recorder().send, Recorder().speak))
 
     assert [c for c in guarding.calls if c[0] == "cancel_order"] == []
 
@@ -1380,7 +1380,7 @@ def test_guard_keeps_memory_of_a_still_naked_order(guarding, monkeypatch):
     monkeypatch.setattr(watch, "GUARD_GRACE", 45.0)
     watch._guard_seen["order:5"] = time.monotonic() - 1
 
-    asyncio.run(watch.guard(FakeHTTP(), {}, [entry_order()], Recorder().send, Recorder().speak))
+    asyncio.run(watch.guard({}, [entry_order()], Recorder().send, Recorder().speak))
 
     assert "order:5" in watch._guard_seen
 

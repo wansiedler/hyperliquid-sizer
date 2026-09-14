@@ -415,9 +415,7 @@ async def _enforce_rules(open_now: dict[str, Position], send, speak) -> None:
             await send(f"❌ {coin}: риск-менеджер не смог закрыть ({exc})")
 
 
-async def guard(
-    http: httpx.AsyncClient, open_now: dict[str, Position], orders: list[dict], send, speak
-) -> None:
+async def guard(open_now: dict[str, Position], orders: list[dict], send, speak) -> None:
     """The risk manager: warn about a rule breach, then enforce it."""
     if not RISK_GUARD:
         return
@@ -1020,7 +1018,7 @@ async def tick(
     except Exception:  # noqa: BLE001
         log.exception("no open orders")
         orders = []
-    await guard(http, after, orders, send, speak)
+    await guard(after, orders, send, speak)
     await trim(http, after, send, speak)
     if before is None:
         return after
